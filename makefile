@@ -10,7 +10,7 @@ run-dbg: wave
 	./wave
 
 wave-fast: wave.cpp ImageUtil.h utils.h
-	$(CPP) -O3 wave.cpp -o wave-fast
+	$(CPP) -O3 wave.cpp -o wave-fast -fopenmp
 
 clean: 
 	-rm wave

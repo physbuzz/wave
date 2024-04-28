@@ -2,10 +2,12 @@
 #include <cassert>
 #include <stdexcept>
 #include <climits>
+#include "math.h"
+
+#include "omp.h"
+
 #include "utils.h"
 #include "ImageUtil.h"
-#include "math.h"
-#include "omp.h"
 
 #define BOUNDARY_EPS 1.0e-2
 
@@ -18,19 +20,21 @@ namespace Wave {
 
 namespace Math {
 
+inline float linearFadeFunc(float time,float fadeTime) {
+    return time<=0?0:(time<fadeTime?time/fadeTime:1);
+}
+
 /* Returns the amplitude of a Gaussian beam pointing in the +x direction, 
 with width s at its most focused (at the origin), frequency w, and wavenumber k.
 It's up to the user to specify w and k correctly. Dispersion (fieldMass>0) is not accounted for.
 The maximum amplitude at (x,y)=(0,0) is normalized to 1.
 */
-
 inline float gaussianBeamAmplitude(float x, float y, float t, float s, float w, float k, float phase) {
     float a=x/(s*s*k);
     float b=y/s;
     return std::exp(-0.5*b*b/(1+a*a))*std::cos(0.5*a*b*b/(1+a*a)-t*w+x*k+phase); 
 
 }
-
 
 inline float gaussianBeamAmplitudeWithDispersion(float x, float y, float t, float m, float s, float w, float k, float phase) {
     std::cerr<<"gaussianBeamAmplitudeWithDispersion not implemented yet."<<std::endl;
@@ -131,48 +135,43 @@ enum SourceStyle{
     HARD
 };
 
+
 class WaveKernel;
 
 struct KernelSource {
 public:
-    SourceType type;
-    SourceStyle style;
-    //KernelSource position
-    float x,y;
-    //KernelSource direction and wave number
-    //float kx,ky;
-    //KernelSource frequency (it is up to the user to specify omega^2/c^2=kx^2+ky^2)
-    float omega;
-    float phase;
-    float amplitude;
-    
-    //slowly apply the source over the first few seconds of sim time.
-    float fadeTime;
-    //If SourceStyle is SOFT, then we allow the wave to be generated over some distance fadeDist
-    //float fadeDist;
-    void apply(WaveKernel* wave);
-private:
-    float fadeFunc(float time) const;
-    //Algo: look up the cell and set phi to cos(omega*time)*(time<fadeTime?time/fadeTime:1)
-    void applyPointHard(WaveKernel* wave);
-    //Algo: Do the same as applyPointHard, but lerp between the old value and the new value.
-    void applyPointSoftSimple(WaveKernel* wave);
-    //Algo: Treat things as if we added a source term to the wave equation, eg. wave->phi[...]+=(calculated value)
-    void applyPointSoftAdvanced(WaveKernel* wave);
-    //Algo: Bresenham line along the source plane setting it equal to some cos(omega*t) value.
-    void applyPlaneHard(WaveKernel* wave);
-    //Algo: same but lerp a bit.
-    void applyPlaneSoftSimple(WaveKernel* wave);
-    //Algo: apply a source term over fadeDist / in a big rotated rectangle. This might be hard to do fast, so do it slow first and then check.
-    void applyPlaneSoftAdvanced(WaveKernel* wave);
-    //Algo: Bresenham line, set it equal to the Gaussian beam formula I found.
-    void applyGaussianBeamHard(WaveKernel* wave);
-    //Algo: Bresenham line, lerp between phi[...] and the hard value.
-    void applyGaussianBeamSoftSimple(WaveKernel* wave);
-    //Algo: apply a source term to create a Gaussian beam using formulas I derived.
-    void applyGaussianBeamSoftAdvanced(WaveKernel* wave);
+    virtual void apply(WaveKernel* wave) = 0;
+    virtual bool checkIfValid(WaveKernel *wave) { return true; };
+    virtual ~KernelSource() = default;
 };
-KernelSource createPointKernelSource(float x, float y, float omega, float amplitude=1, float phase=0, float fadeTime=0.1);
+
+struct HardPointKernelSource : public KernelSource {
+    float x,y;
+    float omega;
+    float amplitude;
+    float phase;
+    float fadeTime;
+    HardPointKernelSource(float x, float y, float omega, float amplitude, float phase=0, float fadeTime=0.1) : 
+            x(x), y(y), omega(omega), amplitude(amplitude), phase(phase), fadeTime(fadeTime) {}
+    void apply(WaveKernel* wave) override;
+    bool checkIfValid(WaveKernel *wave) override;
+};
+
+struct HardGaussianBeamKernelSource : public KernelSource {
+    //HardGaussianBeamParams() : x(0), y(0), nx(1), ny(0), size(2), w(1), s(1), L(5), A(1), phase(0) {}
+    
+    float x,y;
+    float nx,ny;
+    float size;
+    float w,k,s,L,amplitude,phase;
+    float fadeTime;
+    HardGaussianBeamKernelSource(float x, float y, float nx, float ny, float size, 
+        float w,float k, float s, float L, float amplitude=1, float phase=0, float fadeTime=0.1) : 
+            x(x), y(y), nx(nx), ny(ny), size(size), w(w), k(k), s(s), L(L), amplitude(amplitude), phase(phase), fadeTime(fadeTime) { }
+    void apply(WaveKernel* wave) override;
+    bool checkIfValid(WaveKernel *wave) override;
+};
+
 
 
 
@@ -191,7 +190,7 @@ public:
     float dt;
     float time_elapsed;
     std::vector<float> phicur, philast, cellMass, fieldMass2, ttx, tty, txx, tyy, txy, damping, dirich;
-    std::vector<KernelSource> sources;
+    std::vector<std::unique_ptr<KernelSource>> sources;
 
     WaveKernel(int n=2, int m=2,float defaultMass=1) : grid_n(n),grid_m(m), dt(0.01), time_elapsed(0),
     phicur(n*m,0), philast(n*m,0), cellMass(n*m,defaultMass), fieldMass2(n*m,0),
@@ -206,7 +205,7 @@ public:
         }
     }
 
-    //Getters for all the array variables w/ bounds checking through vector.at
+    //Getters for all the array variables through vector.at
     //Can do a const version if we need it later.
     float &getPhi(int i, int j) { return phicur.at(j*grid_n+i); }
     //float getPhi(int i, int j) const { return phicur.at(j*grid_n+i); }
@@ -221,12 +220,10 @@ public:
     float &getTtx(int i, int j) { return ttx.at(j*grid_n+i); }
     float &getTty(int i, int j) { return tty.at(j*grid_n+i); }
 
-    void addPointSource(float i, float j, float omega, float amplitude=1, float phase=0, float fadeTime=0.1) {
-        if(i<=0 || j<=0 || i>=grid_n || j>=grid_m) {
-            std::cerr<<"Point source must be inside the simulation domain."<<std::endl;
-            return;
-        }
-        sources.push_back(createPointKernelSource(i,j,omega,amplitude,phase,fadeTime));
+    void addSource(std::unique_ptr<KernelSource> source) {
+        //Need to check if the source is inside the grid.
+        if(source->checkIfValid(this))
+            sources.push_back(std::move(source));
     }
 
     void timestep(){
@@ -334,8 +331,8 @@ public:
         phicur=phinext;
 
         time_elapsed+=dt;
-        for(auto source : sources){
-            source.apply(this);
+        for(auto &&source : sources){
+            source->apply(this);
         }
     }
 
@@ -348,108 +345,100 @@ public:
 };
 
 
-inline void KernelSource::apply(WaveKernel* wave){
-    switch(type) {
-        case POINT:
-            switch(style){
-                case SOFT_SIMPLE:
-                    applyPointSoftSimple(wave);
-                    break;
-                case SOFT_ADVANCED:
-                    applyPointSoftAdvanced(wave);
-                    break;
-                case HARD:
-                    applyPointHard(wave);
-                    break;
-            }
-            break;
-        case PLANE:
-            switch(style){
-                case SOFT_SIMPLE:
-                    applyPlaneSoftSimple(wave);
-                    break;
-                case SOFT_ADVANCED:
-                    applyPlaneSoftAdvanced(wave);
-                    break;
-                case HARD:
-                    applyPlaneHard(wave);
-                    break;
-            }
-            break;
-        case GAUSSIAN_BEAM:
-            switch(style){
-                case SOFT_SIMPLE:
-                    applyGaussianBeamSoftSimple(wave);
-                    break;
-                case SOFT_ADVANCED:
-                    applyGaussianBeamSoftAdvanced(wave);
-                    break;
-                case HARD:
-                    applyGaussianBeamHard(wave);
-                    break;
-            }
-            break;
-    }
+////////////////////////////////////////////////////////////////////////////
+///////////////////////// KERNEL SOURCES IMPL //////////////////////////////
+////////////////////////////////////////////////////////////////////////////
+
+
+/*
+    //Algo: look up the cell and set phi to cos(omega*time)*(time<fadeTime?time/fadeTime:1)
+    void applyPointHard(WaveKernel* wave);
+    //Algo: Do the same as applyPointHard, but lerp between the old value and the new value.
+    void applyPointSoftSimple(WaveKernel* wave);
+    //Algo: Treat things as if we added a source term to the wave equation, eg. wave->phi[...]+=(calculated value)
+    void applyPointSoftAdvanced(WaveKernel* wave);
+    //Algo: Bresenham line along the source plane setting it equal to some cos(omega*t) value.
+    void applyPlaneHard(WaveKernel* wave);
+    //Algo: same but lerp a bit.
+    void applyPlaneSoftSimple(WaveKernel* wave);
+    //Algo: apply a source term over fadeDist / in a big rotated rectangle. This might be hard to do fast, so do it slow first and then check.
+    void applyPlaneSoftAdvanced(WaveKernel* wave);
+    //Algo: Bresenham line, set it equal to the Gaussian beam formula I found.
+    void applyGaussianBeamHard(WaveKernel* wave);
+    //Algo: Bresenham line, lerp between phi[...] and the hard value.
+    void applyGaussianBeamSoftSimple(WaveKernel* wave);
+    //Algo: apply a source term to create a Gaussian beam using formulas I derived.
+    void applyGaussianBeamSoftAdvanced(WaveKernel* wave);
+*/
+
+//    float x,y;
+//    float omega;
+//    float amplitude;
+//    float phase;
+//    float fadeTime;
+
+inline void HardPointKernelSource::apply(WaveKernel* wave) {
+    wave->getPhi(int(x),int(y))=amplitude*std::cos(omega*wave->time_elapsed+phase)*Math::linearFadeFunc(wave->time_elapsed,fadeTime);
 }
-
-
-
-inline float KernelSource::fadeFunc(float time) const {
-    return time<=0?0:(time<fadeTime?time/fadeTime:1);
-}
-//Algo: look up the cell and set phi to cos(omega*time)*(time<fadeTime?time/fadeTime:1)
-inline void KernelSource::applyPointHard(WaveKernel* wave){
-    if(int(x)<=0 || int(y)<=0 || int(x)>=wave->grid_n || int(y)>=wave->grid_m) {
+inline bool HardPointKernelSource::checkIfValid(WaveKernel *wave) {
+    if(int(x)>0 && int(y)>0 && int(x)<wave->grid_n && int(y)<wave->grid_m) {
+        return true;
+    } else {
         std::cerr<<"Point source must be inside the simulation domain."<<std::endl;
-        return;
+        return false;
     }
-    wave->getPhi(int(x),int(y))=amplitude*std::cos(omega*wave->time_elapsed+phase)*fadeFunc(wave->time_elapsed);
-}
-//Algo: Do the same as applyPointHard, but lerp between the old value and the new value.
-inline void KernelSource::applyPointSoftSimple(WaveKernel* wave){
-    std::cerr<<"applyPointSoftSimple not implemented yet."<<std::endl;
-}
-//Algo: Treat things as if we added a source term to the wave equation, eg. wave->phi[...]+=(calculated value)
-inline void KernelSource::applyPointSoftAdvanced(WaveKernel* wave){
-    std::cerr<<"applyPointSoftAdvanced not implemented yet."<<std::endl;
-}
-//Algo: Bresenham line along the source plane setting it equal to some cos(omega*t) value.
-inline void KernelSource::applyPlaneHard(WaveKernel* wave){
-    std::cerr<<"applyPlaneHard not implemented yet."<<std::endl;
-}
-//Algo: same but lerp a bit.
-inline void KernelSource::applyPlaneSoftSimple(WaveKernel* wave){
-    std::cerr<<"applyPlaneSoftSimple not implemented yet."<<std::endl;
-}
-//Algo: apply a source term over fadeDist / in a big rotated rectangle. This might be hard to do fast, so do it slow first and then check.
-inline void KernelSource::applyPlaneSoftAdvanced(WaveKernel* wave){
-    std::cerr<<"applyPlaneSoftAdvanced not implemented yet."<<std::endl;
-}
-//Algo: Bresenham line, set it equal to the Gaussian beam formula I found.
-inline void KernelSource::applyGaussianBeamHard(WaveKernel* wave){
-    std::cerr<<"applyGaussianBeamHard not implemented yet."<<std::endl;
-}
-//Algo: Bresenham line, lerp between phi[...] and the hard value.
-inline void KernelSource::applyGaussianBeamSoftSimple(WaveKernel* wave){
-    std::cerr<<"applyGaussianBeamSoftSimple not implemented yet."<<std::endl;
-}
-//Algo: apply a source term to create a Gaussian beam using formulas I derived.
-inline void KernelSource::applyGaussianBeamSoftAdvanced(WaveKernel* wave){
-    std::cerr<<"applyGaussianBeamSoftAdvanced not implemented yet."<<std::endl;
 }
 
-KernelSource createPointKernelSource(float x, float y, float omega, float amplitude, float phase, float fadeTime) {
-    //Checks of validity have to be done inside Wave::Wave and Wave::WaveKernel, not here.
-    KernelSource src;
-    src.type=POINT;
-    src.style=HARD;
-    src.x=x;
-    src.y=y;
-    src.omega=omega;
-    src.fadeTime=fadeTime;
-    src.phase=phase;
-    src.amplitude=amplitude;
-    return src;
+
+//Transcribed to C++ calling a function point(x,y) to set the pixel at x,y.
+void bresenhamLine(int x1, int y1, int x2, int y2, void *point(int,int)){
+    int dx=x2-x1;
+    int dy=y2-y1;
+    point(x1,y1);
+    if(std::abs(dx)>std::abs(dy)){ //determine whether the slope is less steep than 45 degrees.
+        float m=dy/float(dx);//calculate the slope as rise/run
+        float b=y1-m*x1; //calculate the y-intercept
+        int sx=dx<0?-1:1;//calculate the direction from x1 to x2
+        while(x1!=x2){ //increase the position until we reach the end of the line
+            x1+=sx;
+            point(x1,m*x1+b);
+        }
+    } else {
+        if(dy!=0){ //if dy=0 and abs(dx)<=abs(dy), we've drawn a dot and so need to do nothing.
+            float m=dx/float(dy); //calculate the slope as run/rise
+            float b=x1-m*y1; //calculate the x-intercept
+            int sy=dy<0?-1:1; //calculate the direction from y1 to y2
+            while(y1!=y2){ //increase the position until we reach the end of the line
+                y1+=sy; 
+                point(m*y1+b,y1);
+            }
+        }
+    }
+}
+
+void HardGaussianBeamKernelSource::apply(WaveKernel* wave) {
+    //Rotation matrix {{nx,-ny},{ny,nx}} applied to {0,size} and {0,-size}
+    float x1=x-ny*size,y1=y+nx*size;
+    float x2=x+ny*size,y2=y-nx*size;
+    //std::cout<<"Applying Gaussian beam from ("<<x1<<","<<y1<<") to ("<<x2<<","<<y2<<")\n";
+    Utils::BresenhamLine line(x1,y1,x2,y2);
+    for(auto &&point : line){
+        int xpix=point.first,ypix=point.second;
+        //Silently ignore points outside or on the boundary.
+        if(xpix<=0 || ypix<=0 || xpix>=wave->grid_n-1 || ypix>=wave->grid_m-1)
+            continue;
+        
+        //To get back to the center: subtract x,y, then rotate back.
+        //{{nx,ny},{-ny,nx}}.{xpix-x,ypix-y}
+        //formula sanity check: if you plug in xpix=x1 and ypix=y1, you get (xrel,yrel)=(0,size).
+        float xrel=(xpix-x)*nx+ny*(ypix-y), yrel=-ny*(xpix-x)+nx*(ypix-y);
+        float amp=amplitude*Math::gaussianBeamAmplitude(xrel-L,yrel,wave->time_elapsed,s,w,k,phase)*Math::linearFadeFunc(wave->time_elapsed,fadeTime);
+        wave->getPhi(xpix,ypix)=amp;
+        //std::cout<<"Setting amplitude at ("<<xpix<<","<<ypix<<") to "<<amp<<"\n";
+    }
+}
+bool HardGaussianBeamKernelSource::checkIfValid(WaveKernel *wave) {
+    return true;
 }
 
 Image renderToImage(const WaveKernel &ker,int xCropping=0,int yCropping=0, ColorScheme scheme=RED_BLUE){
@@ -459,6 +448,9 @@ Image renderToImage(const WaveKernel &ker,int xCropping=0,int yCropping=0, Color
     Image outimg(ker.grid_n-2*xCropping,ker.grid_m-2*yCropping);
     switch(scheme){
         case RED_BLUE:
+            #if defined(_OPENMP)
+            #pragma omp parallel for
+            #endif
             for(int j=yCropping;j<ker.grid_m-yCropping;j++){
                 for(int i=xCropping;i<ker.grid_n-xCropping;i++){
                     int index=j*ker.grid_n+i;
@@ -470,6 +462,9 @@ Image renderToImage(const WaveKernel &ker,int xCropping=0,int yCropping=0, Color
             }
             break;
         case GRAYSCALE:
+            #if defined(_OPENMP)
+            #pragma omp parallel for
+            #endif
             for(int j=yCropping;j<ker.grid_m-yCropping;j++){
                 for(int i=xCropping;i<ker.grid_n-xCropping;i++){
                     int index=j*ker.grid_n+i;
@@ -642,7 +637,7 @@ private:
 
         //Instantiate kernel. The "mass" of each cell is related to the speed of light by c=sqrt(mu/T),
         //T defaults to 1, so we pass in mu dx^2 = c^2 T dx^2. 
-        ker=WaveKernel(grid_n,grid_m,dx*dx*domain.speedOfLight*domain.speedOfLight);
+        ker=WaveKernel(grid_n,grid_m,dx*dx/(domain.speedOfLight*domain.speedOfLight));
         //Fill the appropriate damping values inside the Kernel
         kernelSetDamping();
         state=SIM_CONFIG;
@@ -728,8 +723,44 @@ public:
     void addPointSource(float x, float y, float omega, float amplitude=1, float phase=0, float fadeTime=0.1) {
         kernelCheck();
         float i=domain.xToI(x), j=domain.yToJ(y);
-        ker.addPointSource(i,j,omega,amplitude,phase,fadeTime);
+        ker.addSource(std::make_unique<HardPointKernelSource>(i,j,omega,amplitude,phase,fadeTime)); 
     }
+    void addHardGaussianBeam(float x, float y, float nx, float ny, float size, float w, float s, float L, float amplitude=1, float phase=0, float fadeTime=0.1) {
+        kernelCheck();
+        float n=std::sqrt(nx*nx+ny*ny);
+        if(n<=0) {
+            std::cerr<<"Invalid direction vector."<<std::endl;
+            return;
+        }
+        float i=domain.xToI(x), j=domain.yToJ(y);
+        if(i<=0 || j<=0 || i>=ker.grid_n-1 || j>=ker.grid_m-1) {
+            std::cerr<<"Gaussian beam center must be inside the simulation domain."<<std::endl;
+            std::cerr<<"(Not implemented yet: this can be fixed by specifying k manually in units of 1/[pixels])"<<std::endl;
+            return;
+        }
+        size/=domain.getDx();
+        s/=domain.getDx();
+        L/=domain.getDx();
+        //k is the wavenumber, and we want to set it to the correct value for this lattice.
+        //For constant tension and mu, k=omega/sqrt(T/cellMass). For defaults, T=1, cellMass=1*dx^2, so k=omega*dx.
+        //Let's try to make sense of these units. The EOM has units of [cellMass]/[time]^2 == [tension]
+        //So T/cellMass has units of 1/[time]^2, so omega/sqrt(T/cellMass) is unitless. This is correct because
+        //k should have units of 1/[pixels]. 
+        //...here's hoping, anyways.
+        float k=w/std::sqrt(ker.getTxx(i,j)/ker.getCellMass(i,j));
+
+        if(verbosity>=2){
+            std::cout<<"Adding Gaussian beam. Parameters (in grid-space) are:\n";
+            std::cout<<"pos=("<<i<<","<<j<<"), dir=("<<nx<<","<<ny<<"), size="<<size<<"\n";
+            std::cout<<"w="<<w<<", k="<<k<<", s="<<s<<", L="<<L<<", A="<<amplitude<<", phase="<<phase<<std::endl;
+        }
+
+
+        ker.addSource(std::make_unique<HardGaussianBeamKernelSource>(i,j,nx,ny,size,w,k,s,L,amplitude,phase,fadeTime));
+    }
+
+
+    
     //Original plan was to have KernelSource be public facing, but because of the coordinate transformation
     //this is a bad idea. In the future I could implement a Source object, then coordinate transform to a KernelSource.
     /*
@@ -755,14 +786,16 @@ public:
     void generateImageSeries(float totalTime) {
         kernelCheck();
 
-        if(verbosity>=2)
-            std::cout<<"Generating image series.\n";
         int nsteps=int(totalTime/(ker.dt*timestep.nSubsteps));
+        if(verbosity>=2) {
+            std::cout<<"Generating image series, rendering "<<nsteps<<" images.\n";
+        }
         for(int k=0;k<nsteps;k++){
             for(int j=0;j<timestep.nSubsteps;j++){
                 ker.timestep();
             }
-            renderToImage(ker,domain.npadx,domain.npady,image.colorScheme).save(image.getFilename(k));
+            //renderToImage(ker,domain.npadx,domain.npady,image.colorScheme).save(image.getFilename(k));
+            //renderToImage(ker,domain.npadx,domain.npady,image.colorScheme);
         }
     }
 
@@ -778,22 +811,16 @@ public:
 
 
 
-int main() {
+int renderConfig1(){
     int imgx=640, imgy=480;
     int dampingSize=90;
     float LSim=18;
     float maxDamping=15.0;
     float aspect=float(imgy)/imgx;
-    int fps=10;
     int substeps=4;
 
-
-#if defined(_OPENMP)
-    omp_set_num_threads(8);
-#endif
-
     Wave::Wave wave;
-    wave.setVerbosity(2);
+    wave.setVerbosity(3);
     wave.setDomain(-LSim/2, -LSim*aspect/2, LSim/2, LSim*aspect/2);
     wave.setNx(imgx);
     wave.setDamping(dampingSize,dampingSize,maxDamping);
@@ -801,9 +828,8 @@ int main() {
     wave.setSpeedOfLight(1.0);
 
     wave.setDt(0.01);
-    wave.setNSubsteps(substeps);
+    wave.setNSubsteps(5);
 
-    //Add five random sources with random frequencies.
     srand(time(NULL));
     float sz=1.0;
     for(int k=0;k<60;k++){
@@ -814,12 +840,49 @@ int main() {
         float amp=Utils::randf(0.1,2.0);
         wave.addPointSource(x,y,omega, amp,phase);
     }
-    //wave.addPointSource(0,0,10,10);
 
     wave.setColorScheme(Wave::ColorScheme::RED_BLUE);
     wave.setOutputFolder("out");
-    wave.setImageFormat("pointsource_gray_",5,"bmp");
-    wave.generateImageSeries(30);
+    wave.setImageFormat("config1",5,"bmp");
+    wave.generateImageSeries(15);
+    return 0;
+}
+
+void renderConfig2(){
+    int imgx=640, imgy=480;
+    int dampingSize=180;
+    float LSim=18;
+    float maxDamping=10.0;
+    float aspect=float(imgy)/imgx;
+    int substeps=40;
+
+    Wave::Wave wave;
+    wave.setVerbosity(3);
+    wave.setDomain(-LSim/2, -LSim*aspect/2, LSim/2, LSim*aspect/2);
+    wave.setNx(imgx);
+    wave.setDamping(dampingSize,dampingSize,maxDamping);
+
+    wave.setSpeedOfLight(2.0);
+
+    wave.setDt(0.001);
+    wave.setNSubsteps(50);
+
+    float theta=0;
+    wave.addHardGaussianBeam(-9,0,std::cos(theta),std::sin(theta),9,10,3,9,1,0);
+
+    wave.setColorScheme(Wave::ColorScheme::RED_BLUE);
+    wave.setOutputFolder("out");
+    wave.setImageFormat("config5_",5,"bmp");
+    wave.generateImageSeries(10);
+}
+
+int main() {
+
+#if defined(_OPENMP)
+    omp_set_num_threads(6);
+#endif
+
+    renderConfig2();
     return 0;
 }
 
